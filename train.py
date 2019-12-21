@@ -10,6 +10,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 import torchvision
 from torch.distributions import Bernoulli
+from torch.utils.checkpoint import checkpoint
 from torchvision.utils import save_image
 
 
@@ -101,8 +102,6 @@ class ConcatMinMax(nn.Module):
 
 
 class MaskedConv2d(nn.Module):
-    num_subpixels = 8 * 3
-
     def __init__(self, in_dim, out_dim, kernel_size, c_size, h_size, w_size, mask_type, **kwargs):
         super().__init__()
         dilation = kwargs.get('dilation', 1)
@@ -120,7 +119,7 @@ class MaskedConv2d(nn.Module):
             Lambda(lambda x: x[..., :-padding]),
             LearnedPadding2d(in_dim, h_size, w_size - padding, padding, requires_grad=False),
             nn.Conv2d(in_dim, out_dim, kernel_size=kernel_size-1, dilation=dilation),
-        ) if kernel_size > 1 else Lambda(lambda x: torch.zeros_like(x))
+        ) if kernel_size > 1 else Lambda(lambda x: 0.)
 
         self.subpixel_convs = nn.ModuleList([
             nn.Conv2d(
@@ -128,46 +127,13 @@ class MaskedConv2d(nn.Module):
                 self.out_subpixel_c_size,
                 kernel_size=1,
             )
-            for i in range(self.num_subpixels - (mask_type == 'A'))
+            for i in range(c_size - (mask_type == 'A'))
         ])
         self.base_subpixel_conv_out_index = self.out_subpixel_c_size if self.mask_type == 'A' else 0
-        """
-        self.r_conv = nn.Conv2d(
-            in_subpixel_c_size,
-            out_subpixel_c_size,
-            kernel_size=1,
-        )
-        self.rg_conv = nn.Conv2d(
-            in_subpixel_c_size * 2,
-            out_subpixel_c_size,
-            kernel_size=1,
-        )
-
-        if mask_type == 'B':
-            self.rgb_conv = nn.Conv2d(
-                in_subpixel_c_size * 3,
-                out_subpixel_c_size,
-                kernel_size=1,
-            )
-        """
 
     def forward(self, x):
-        # TODO: JIT
         n_size, c_size, h_size, w_size = x.shape
         subpixel_conv_results = x.new_empty(n_size, self.out_dim, h_size, w_size)
-
-        # if self.mask_type == 'A':
-        #     subpixel_conv_results.append(
-        #         x.new_zeros(n_size, self.out_subpixel_c_size, h_size, w_size)
-        #     )
-        #
-        # for i, subpixel_conv in enumerate(self.subpixel_convs):
-        #     index = self.in_subpixel_c_size * (i + 1)
-        #     subpixel_conv_results.append(
-        #         subpixel_conv(x[:, :index])
-        #     )
-        #
-        # return x + torch.cat(subpixel_conv_results, dim=1)
 
         for i, subpixel_conv in enumerate(self.subpixel_convs):
             in_index = self.in_subpixel_c_size * (i + 1)
@@ -201,7 +167,8 @@ class PixelSharp(nn.Module):
 
                 padding = dilation
                 v_conv.append(nn.Sequential(
-                    LearnedPadding2d(*input_sizes, padding, padding, padding, 0, requires_grad=False),
+                    LearnedPadding2d(*input_sizes, padding, padding, padding, 0,
+                                     requires_grad=False),
                     nn.Conv2d(
                         input_dim,
                         dim,
@@ -211,7 +178,7 @@ class PixelSharp(nn.Module):
                 ))
                 v_act.append(nn.Sequential(
                     ConcatMinMax(),
-                    # nn.BatchNorm2d(dim),
+                    nn.BatchNorm2d(dim),
                     # nn.Dropout2d(),
                 ))
 
@@ -227,7 +194,7 @@ class PixelSharp(nn.Module):
 
                 h_act.append(nn.Sequential(
                     ConcatMinMax(),
-                    # nn.BatchNorm2d(dim),
+                    nn.BatchNorm2d(dim),
                     # nn.Dropout2d(),
                 ))
 
@@ -250,10 +217,10 @@ class PixelSharp(nn.Module):
         self.h2h = nn.ModuleList(h2h)
         self.out = nn.Sequential(
             ConcatMinMax(),
-            MaskedConv2d(input_dim, 1008, 2, *sizes, mask_type='B'),
+            MaskedConv2d(input_dim, 1008, 1, *sizes, mask_type='B'),
             # nn.ReLU(),
             ConcatMinMax(),
-            MaskedConv2d(1008, c_size, 2, *sizes, mask_type='B'),
+            MaskedConv2d(1008, c_size, 1, *sizes, mask_type='B'),
             # nn.ReLU(),
         )
         self.r = r
@@ -283,10 +250,17 @@ class PixelSharp(nn.Module):
                 res_vx = vx
 
             v_conv_x = v_conv(vx)
-            vx = res_vx + v_act(v_conv_x)
             h_conv_x = h_conv(hx)
+
+            vx = res_vx + v_act(v_conv_x)
+            # vx = res_vx + checkpoint(v_act, v_conv_x)
+
             h_act_x = h_act(h_conv_x + v2h(v_conv_x))
-            hx = res_hx + h2h(h_act_x)
+            # h_act_x = checkpoint(h_act, h_conv_x + checkpoint(v2h, v_conv_x))
+
+            # hx = res_hx + h2h(h_act_x)
+            hx = res_hx + checkpoint(h2h, h_act_x)
+
             skip_connection.append(h_act_x)
 
         x = sum(skip_connection)
@@ -386,9 +360,9 @@ def loop(ctx, phase):
             optimizer.zero_grad()
             loss = criterion(logits, reshaped_y)
 
-            # with amp.scale_loss(loss, optimizer) as scaled_loss:
-            #     scaled_loss.backward()
-            loss.backward()
+            with amp.scale_loss(loss, optimizer) as scaled_loss:
+                scaled_loss.backward()
+            # loss.backward()
 
             optimizer.step()
             # scheduler.step()
@@ -458,7 +432,7 @@ def main():
     ctx['dataloaders'] = {
         phase: torch.utils.data.DataLoader(
             dataset,
-            batch_size=12,
+            batch_size=32,
             shuffle=True,
             num_workers=1,
             pin_memory=True,
@@ -472,7 +446,7 @@ def main():
         model.parameters(),
         lr=1e-3,
     )
-    # model, optimizer = amp.initialize(model, optimizer, opt_level='O1')
+    model, optimizer = amp.initialize(model, optimizer, opt_level='O1')
     ctx['model'], ctx['optimizer'] = model, optimizer
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
