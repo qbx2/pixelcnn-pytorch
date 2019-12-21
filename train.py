@@ -152,7 +152,7 @@ class PixelSharp(nn.Module):
         self.sizes = sizes = input_sizes = c_size, h_size, w_size
         num_blocks = 3
         num_layers_per_block = 5
-        dim = 192  # TODO: * 3
+        dim = 144  # TODO: * 3
         input_dim = c_size
         v_conv, v_act, h_conv, h_act, v2h, h2h = [], [], [], [], [], []
 
@@ -217,10 +217,10 @@ class PixelSharp(nn.Module):
         self.h2h = nn.ModuleList(h2h)
         self.out = nn.Sequential(
             ConcatMinMax(),
-            MaskedConv2d(input_dim, 1008, 1, *sizes, mask_type='B'),
+            MaskedConv2d(input_dim, 384, 1, *sizes, mask_type='B'),
             # nn.ReLU(),
             ConcatMinMax(),
-            MaskedConv2d(1008, c_size, 1, *sizes, mask_type='B'),
+            MaskedConv2d(384, c_size, 1, *sizes, mask_type='B'),
             # nn.ReLU(),
         )
         self.r = r
@@ -258,8 +258,8 @@ class PixelSharp(nn.Module):
             h_act_x = h_act(h_conv_x + v2h(v_conv_x))
             # h_act_x = checkpoint(h_act, h_conv_x + checkpoint(v2h, v_conv_x))
 
-            # hx = res_hx + h2h(h_act_x)
-            hx = res_hx + checkpoint(h2h, h_act_x)
+            hx = res_hx + h2h(h_act_x)
+            # hx = res_hx + checkpoint(h2h, h_act_x)
 
             skip_connection.append(h_act_x)
 
@@ -272,7 +272,7 @@ class PixelSharp(nn.Module):
         num_bits = 8
         n_size, cb_size, h_size, w_size = logits.shape
         c_size = cb_size // num_bits
-        probs = torch.sigmoid(logits).view(n_size, c_size, 8, 1, 1, h_size, w_size)
+        probs = torch.sigmoid(logits).view(n_size, c_size, num_bits, 1, 1, h_size, w_size)
         out = probs.new_ones(n_size, c_size, 256, h_size, w_size)
 
         for i in range(num_bits):
@@ -295,7 +295,6 @@ class PixelSharp(nn.Module):
         c_size, h_size, w_size = self.sizes
         out = torch.zeros(n, c_size, h_size, w_size, dtype=torch.float, device=device)
 
-        # TODO: Covariance
         for y in range(h_size):
             for x in range(w_size):
                 for c in range(c_size):
@@ -434,7 +433,7 @@ def main():
             dataset,
             batch_size=32,
             shuffle=True,
-            num_workers=1,
+            num_workers=2,
             pin_memory=True,
         )
         for phase, dataset in datasets.items()
@@ -444,7 +443,7 @@ def main():
     model.to(device)
     optimizer = optim.Adam(
         model.parameters(),
-        lr=1e-3,
+        lr=5e-3,
     )
     model, optimizer = amp.initialize(model, optimizer, opt_level='O1')
     ctx['model'], ctx['optimizer'] = model, optimizer
@@ -465,7 +464,7 @@ def main():
     '''
     ctx['scheduler'] = scheduler
 
-    for epoch in range(500):
+    for epoch in range(150):
         ctx['epoch'] = epoch
         print(f'lr: {optimizer.param_groups[0]["lr"]}')
         ctx = loop(ctx, 'train')
