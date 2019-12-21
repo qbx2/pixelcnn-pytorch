@@ -9,7 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import torchvision
-from torch.distributions import Categorical
+from torch.distributions import Bernoulli
 from torchvision.utils import save_image
 
 
@@ -30,6 +30,7 @@ class LearnedPadding2d(nn.Module):
     def __init__(self, c_size, h_size, w_size, x1, x2=0, y1=0, y2=0, requires_grad=True):
         super().__init__()
         self.args = x1, x2, y1, y2
+        self.requires_grad = requires_grad
         self.x1 = nn.Parameter(torch.zeros(1, c_size, h_size, x1), requires_grad)
         self.x2 = nn.Parameter(torch.zeros(1, c_size, h_size, x2), requires_grad)
         w_size = x1 + w_size + x2
@@ -39,6 +40,10 @@ class LearnedPadding2d(nn.Module):
     def forward(self, x):
         x1, x2, y1, y2 = self.args
         x = F.pad(x, self.args)
+
+        if not self.requires_grad:
+            return x
+
         neg_x2 = -x2 if x2 else None
         neg_y2 = -y2 if y2 else None
 
@@ -96,6 +101,8 @@ class ConcatMinMax(nn.Module):
 
 
 class MaskedConv2d(nn.Module):
+    num_subpixels = 8 * 3
+
     def __init__(self, in_dim, out_dim, kernel_size, c_size, h_size, w_size, mask_type, **kwargs):
         super().__init__()
         dilation = kwargs.get('dilation', 1)
@@ -104,17 +111,27 @@ class MaskedConv2d(nn.Module):
         self.kernel_size = kernel_size
         self.c_size = c_size
         self.mask_type = mask_type
-        self.in_rg_index = in_subpixel_c_size = in_dim // c_size
-        self.in_gb_index = self.in_rg_index * 2
-        self.out_rg_index = out_subpixel_c_size = out_dim // c_size
-        self.out_gb_index = self.out_rg_index * 2
+        self.in_subpixel_c_size = in_dim // c_size
+        self.out_subpixel_c_size = out_dim // c_size
+        self.out_dim = out_dim
 
         padding = (kernel_size - 1) * dilation
         self.conv = nn.Sequential(
             Lambda(lambda x: x[..., :-padding]),
-            LearnedPadding2d(in_dim, h_size, w_size - padding, padding),
+            LearnedPadding2d(in_dim, h_size, w_size - padding, padding, requires_grad=False),
             nn.Conv2d(in_dim, out_dim, kernel_size=kernel_size-1, dilation=dilation),
         ) if kernel_size > 1 else Lambda(lambda x: torch.zeros_like(x))
+
+        self.subpixel_convs = nn.ModuleList([
+            nn.Conv2d(
+                self.in_subpixel_c_size * (i + 1),
+                self.out_subpixel_c_size,
+                kernel_size=1,
+            )
+            for i in range(self.num_subpixels - (mask_type == 'A'))
+        ])
+        self.base_subpixel_conv_out_index = self.out_subpixel_c_size if self.mask_type == 'A' else 0
+        """
         self.r_conv = nn.Conv2d(
             in_subpixel_c_size,
             out_subpixel_c_size,
@@ -132,22 +149,34 @@ class MaskedConv2d(nn.Module):
                 out_subpixel_c_size,
                 kernel_size=1,
             )
+        """
 
     def forward(self, x):
-        r = x[:, :self.in_rg_index]
-        rg = x[:, :self.in_gb_index]
-        rgb = x
+        # TODO: JIT
+        n_size, c_size, h_size, w_size = x.shape
+        subpixel_conv_results = x.new_empty(n_size, self.out_dim, h_size, w_size)
+
+        # if self.mask_type == 'A':
+        #     subpixel_conv_results.append(
+        #         x.new_zeros(n_size, self.out_subpixel_c_size, h_size, w_size)
+        #     )
+        #
+        # for i, subpixel_conv in enumerate(self.subpixel_convs):
+        #     index = self.in_subpixel_c_size * (i + 1)
+        #     subpixel_conv_results.append(
+        #         subpixel_conv(x[:, :index])
+        #     )
+        #
+        # return x + torch.cat(subpixel_conv_results, dim=1)
+
+        for i, subpixel_conv in enumerate(self.subpixel_convs):
+            in_index = self.in_subpixel_c_size * (i + 1)
+            out_index = self.base_subpixel_conv_out_index + self.out_subpixel_c_size * i
+            subpixel_conv_results[:, out_index:out_index + self.out_subpixel_c_size] = \
+                subpixel_conv(x[:, :in_index])
+
         x = self.conv(x)
-
-        if self.mask_type == 'A':
-            x[:, self.out_rg_index:self.out_gb_index] += self.r_conv(r)
-            x[:, self.out_gb_index:] += self.rg_conv(rg)
-        elif self.mask_type == 'B':
-            x[:, :self.out_rg_index] += self.r_conv(r)
-            x[:, self.out_rg_index:self.out_gb_index] += self.rg_conv(rg)
-            x[:, self.out_gb_index:] += self.rgb_conv(rgb)
-
-        return x
+        return x + subpixel_conv_results
 
 
 class PixelSharp(nn.Module):
@@ -172,7 +201,7 @@ class PixelSharp(nn.Module):
 
                 padding = dilation
                 v_conv.append(nn.Sequential(
-                    LearnedPadding2d(*input_sizes, padding, padding, padding, 0),
+                    LearnedPadding2d(*input_sizes, padding, padding, padding, 0, requires_grad=False),
                     nn.Conv2d(
                         input_dim,
                         dim,
@@ -182,7 +211,7 @@ class PixelSharp(nn.Module):
                 ))
                 v_act.append(nn.Sequential(
                     ConcatMinMax(),
-                    nn.BatchNorm2d(dim),
+                    # nn.BatchNorm2d(dim),
                     # nn.Dropout2d(),
                 ))
 
@@ -198,7 +227,7 @@ class PixelSharp(nn.Module):
 
                 h_act.append(nn.Sequential(
                     ConcatMinMax(),
-                    nn.BatchNorm2d(dim),
+                    # nn.BatchNorm2d(dim),
                     # nn.Dropout2d(),
                 ))
 
@@ -208,15 +237,9 @@ class PixelSharp(nn.Module):
                 h2h.append(MaskedConv2d(input_dim, input_dim, 1, *sizes, mask_type='B'))
                 input_sizes = (input_dim, *input_sizes[1:])
 
-        '''
-        self.embeddings = nn.ModuleList([
-            nn.Embedding.from_pretrained(torch.arange(256).view(-1, 1) / 127.5 - 1.)
-            for _ in range(c_size)
-        ])
-        '''
         self.x2vx = nn.Sequential(
             Lambda(lambda x: x[..., :-1, :]),
-            LearnedPadding2d(c_size, h_size - 1, w_size, 0, 0, 1),
+            LearnedPadding2d(c_size, h_size - 1, w_size, 0, 0, 1, requires_grad=False),
         )
         self.vx2vx = nn.Conv2d(c_size, v_conv[0][-1].out_channels, 1)
         self.v_conv = nn.ModuleList(v_conv)
@@ -227,16 +250,13 @@ class PixelSharp(nn.Module):
         self.h2h = nn.ModuleList(h2h)
         self.out = nn.Sequential(
             ConcatMinMax(),
-            MaskedConv2d(input_dim, 1020, 2, *sizes, mask_type='B'),
+            MaskedConv2d(input_dim, 1008, 2, *sizes, mask_type='B'),
             # nn.ReLU(),
-            # MaskedConv2d(input_dim, 768, *sizes, mask_type='B'),
             ConcatMinMax(),
-            MaskedConv2d(1020, 8 * c_size, 2, *sizes, mask_type='B'),
+            MaskedConv2d(1008, c_size, 2, *sizes, mask_type='B'),
             # nn.ReLU(),
-            # MaskedConv2d(768, 256 * c_size, *sizes, mask_type='B'),
         )
         self.r = r
-        self.register_buffer('bin2dec', (2 ** (7 - torch.arange(8))).T.float())
 
         self.reset_parameters()
 
@@ -247,15 +267,8 @@ class PixelSharp(nn.Module):
                 nn.init.zeros_(m.bias)
 
     def forward(self, x):
-        '''
-        x = torch.stack([
-            embedding(cx)[..., 0]
-            for embedding, cx in zip(self.embeddings, x.transpose(0, 1))
-        ], dim=1)
-        '''
-        x = x.transpose(2, -1) @ self.bin2dec
-        x = x / 127.5 - 1.
-        n_size, c_size, h_size, w_size = x.shape
+        # x = x / 127.5 - 1.
+        x = x * 2. - 1.
         vx = self.x2vx(x)
         hx = x
         skip_connection = []
@@ -277,24 +290,51 @@ class PixelSharp(nn.Module):
             skip_connection.append(h_act_x)
 
         x = sum(skip_connection)
-        # NOTE: should not .view(n_size, 256, c_size, h_size, w_size) due to masked cnn
-        return self.out(x).view(n_size, c_size, 8, h_size, w_size)
+        # NOTE: should care behavior of masked cnn
+        logits = self.out(x)
+        return logits
+
+    def prob_packbits(self, logits):
+        num_bits = 8
+        n_size, cb_size, h_size, w_size = logits.shape
+        c_size = cb_size // num_bits
+        probs = torch.sigmoid(logits).view(n_size, c_size, 8, 1, 1, h_size, w_size)
+        out = probs.new_ones(n_size, c_size, 256, h_size, w_size)
+
+        for i in range(num_bits):
+            p = probs[:, :, i]
+            a = 1 << i
+            b = 256 >> i
+            out = out.view(n_size, c_size, a, b, h_size, w_size)
+            out[:, :, :, :b // 2] *= 1. - p
+            out[:, :, :, b // 2:] *= p
+
+        return out.view(n_size, c_size, 256, h_size, w_size)
 
     def sample(self, n=1):
+        prev_device = next(self.parameters()).device
+        device = torch.device('cpu')
+        self.to(device)
+
         prev_training = self.training
         self.eval()
         c_size, h_size, w_size = self.sizes
-        out = torch.zeros(n, c_size, h_size, w_size, dtype=torch.float, device=next(self.parameters()).device)
+        out = torch.zeros(n, c_size, h_size, w_size, dtype=torch.float, device=device)
 
+        # TODO: Covariance
         for y in range(h_size):
             for x in range(w_size):
                 for c in range(c_size):
-                    # logits = self(out[..., :y+1, :])[:, :, c, y, x]
-                    logits = self(out)[:, :, c, y, x]
-                    distribution = Categorical(logits=logits)
-                    out[:, c, y, x] = distribution.sample().float()
+                    # TODO: Uncomment following line after lifting LearnedPadding2d
+                    logits = self(out[..., :y+1, :])
+                    # logits = self(out)
+                    # probs = self.prob_packbits(logits)
+                    # distribution = Categorical(probs=probs[:, c, :, y, x])
+                    distribution = Bernoulli(logits=logits[:, c, y, x])
+                    out[:, c, y, x] = distribution.sample()
 
         self.train(prev_training)
+        self.to(prev_device)
         return out
 
 
@@ -314,6 +354,7 @@ def loop(ctx, phase):
     model.train(is_train)
     # criterion = nn.CrossEntropyLoss()
     criterion = nn.BCEWithLogitsLoss()
+    nll_loss_criterion = nn.NLLLoss()
     metrics = defaultdict(lambda: 0.)
     num_metrics = 0
 
@@ -332,37 +373,48 @@ def loop(ctx, phase):
 
     os.makedirs(out_dir, exist_ok=True)
 
-    for (original_x, x), _ in dataloader:
-        original_x = original_x.to(device, torch.long, non_blocking=True).permute(0, 3, 1, 2)
-        x = x.to(device, torch.float, non_blocking=True).permute(0, 3, 4, 1, 2)
+    for (x, y), _ in dataloader:
+        x = x.to(device, torch.long, non_blocking=True).permute(0, 3, 1, 2)
+        y = y.to(device, torch.float, non_blocking=True).permute(0, 3, 4, 1, 2)
+        n_size, c_size, num_bits, h_size, w_size = y.shape
+        reshaped_y = y.view(n_size, c_size * num_bits, h_size, w_size)
 
-        normalized_x = original_x.float() / 127.5 - 1.
-        logits = model(x)
-        loss = criterion(logits, x)
+        normalized_x = x.float() / 127.5 - 1.
+        logits = model(reshaped_y)
 
         if is_train:
             optimizer.zero_grad()
+            loss = criterion(logits, reshaped_y)
 
-            with amp.scale_loss(loss, optimizer) as scaled_loss:
-                scaled_loss.backward()
+            # with amp.scale_loss(loss, optimizer) as scaled_loss:
+            #     scaled_loss.backward()
+            loss.backward()
 
             optimizer.step()
             # scheduler.step()
             train_step += 1
 
         with torch.no_grad():
+            probs = model.prob_packbits(logits)
+            nll_loss = nll_loss_criterion(probs.transpose(1, 2).log(), x)
             num_metrics += 1
-            metrics['loss'] += loss
+            metrics['loss'] += nll_loss
+
+            if is_train:
+                metrics['bce_loss'] += loss
 
             if is_train and train_step % 100 == 99:
                 loss = log_metrics()['loss']
                 postfix = f'_{loss:.3f}_{ctx["pscp"]}'
 
-                sample = [normalized_x, logits.argmax(2) / 127.5 - 1.]
+                sample = [normalized_x, probs.argmax(2) / 127.5 - 1.]
 
-                if train_step % 1000 == 999:
+                if train_step % 1000 == 999 and False:
                     postfix += '_s'
-                    sample.append(model.sample(4) / 127.5 - 1.)
+                    sample = model.sample(1).cpu().numpy()
+                    breakpoint()
+                    sample = numpy.packbits(sample)
+                    sample.append(sample / 127.5 - 1.)
 
                 # if i % (m * 10) == 0:
                 #     resultsample.append(vae.decode(z))
@@ -384,6 +436,7 @@ def loop(ctx, phase):
 
 def transform(image):
     image = numpy.array(image)
+    # return image
     binary_image = numpy.unpackbits(numpy.expand_dims(image, axis=-1), axis=-1)
     return image, binary_image
 
@@ -405,22 +458,22 @@ def main():
     ctx['dataloaders'] = {
         phase: torch.utils.data.DataLoader(
             dataset,
-            batch_size=32,
+            batch_size=12,
             shuffle=True,
             num_workers=1,
             pin_memory=True,
         )
         for phase, dataset in datasets.items()
     }
-    model = PixelSharp(3, 32, 32)
+    model = PixelSharp(3 * 8, 32, 32)
     print(f'r = {model.r}')
     model.to(device)
     optimizer = optim.Adam(
         model.parameters(),
         lr=1e-3,
     )
-    ctx['model'], ctx['optimizer'] = model, optimizer = \
-        amp.initialize(model, optimizer, opt_level='O0')
+    # model, optimizer = amp.initialize(model, optimizer, opt_level='O1')
+    ctx['model'], ctx['optimizer'] = model, optimizer
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
         patience=3,
