@@ -108,7 +108,7 @@ class MaskedConv2d(torch.jit.ScriptModule):
     __constants__ = ['in_dim', 'out_dim', 'in_subpixel_c_size', 'out_subpixel_c_size',
                      'base_subpixel_conv_out_index', 'padding', 'kernel_size', 'mask_type']
 
-    def __init__(self, in_dim, out_dim, kernel_size, c_size, h_size, w_size, mask_type, bias=True, **kwargs):
+    def __init__(self, in_dim, out_dim, kernel_size, c_size, mask_type, bias=True, **kwargs):
         super().__init__()
         dilation = kwargs.get('dilation', 1)
         assert mask_type in ('A', 'B')
@@ -190,11 +190,11 @@ class PixelSharp(nn.Module):
         assert format in ('softmax', 'bit', 'byte')
         self.format = format
 
-        self.sizes = sizes = input_sizes = c_size, h_size, w_size
+        self.sizes = input_sizes = c_size, h_size, w_size
         num_blocks = 1
-        num_layers_per_block = 8
-        dim = 64
-        input_dim = c_size
+        num_layers_per_block = 16
+        dim = 162
+        input_dim = c_size + 1  # + x0
         v_conv, v_act, h_conv, h_act, v2h = [], [], [], [], []
 
         # TODO: h0
@@ -223,7 +223,7 @@ class PixelSharp(nn.Module):
                         input_dim,
                         dim,
                         kernel_size,
-                        *sizes,
+                        c_size,
                         dilation=dilation,
                         mask_type='A' if (i, j) == (0, 0) else 'B',
                         # bias=False,
@@ -242,7 +242,7 @@ class PixelSharp(nn.Module):
                     # ConcatReLU(),
                     GatedActivation2d(),
                     # nn.Conv2d(input_dim, input_dim, 1),
-                    MaskedConv2d(input_dim, input_dim, 1, *sizes, mask_type='B'),
+                    MaskedConv2d(input_dim, input_dim, 1, c_size, mask_type='B'),
                     # nn.Dropout2d(0.),
                     # nn.BatchNorm2d(input_dim),
                 ))
@@ -250,12 +250,14 @@ class PixelSharp(nn.Module):
                 v2h.append(nn.Conv2d(dim, dim, 1))
                 input_sizes = (input_dim, *input_sizes[1:])
 
+        # TODO: move to F.pad with 1 to channels dim
+        self.x0 = nn.Parameter(torch.ones(1, 1, h_size, w_size))
         self.x2vx = nn.Sequential(
             Lambda(lambda x: x[..., :-1, :]),
             LearnedPadding2d(c_size, h_size - 1, w_size, 0, 0, 1, requires_grad=False),
         )
         # vx2vx is for residual connection
-        self.vx2vx = nn.Conv2d(c_size, v_conv[1].in_channels if len(v_conv) >= 2 else input_dim, 1)
+        self.vx2vx = nn.Conv2d(c_size + 1, v_conv[1].in_channels if len(v_conv) >= 2 else input_dim, 1)
         self.v_conv = nn.ModuleList(v_conv)
         self.v_act = nn.ModuleList(v_act)
         self.h_conv = nn.ModuleList(h_conv)
@@ -264,12 +266,19 @@ class PixelSharp(nn.Module):
         self.out = nn.Sequential(
             MaskedConv2d(
                 input_dim,
-                c_size * {'softmax': 256, 'byte': 8, 'bit': 1}[format],
+                input_dim,
                 1,
-                *sizes,
+                c_size,
                 mask_type='B',
             ),
-            # nn.ReLU(),
+            nn.ReLU(),
+            MaskedConv2d(
+                input_dim,
+                c_size * {'softmax': 256, 'byte': 8, 'bit': 1}[format],
+                1,
+                c_size,
+                mask_type='B',
+            ),
         )
         self.r = r
 
@@ -287,13 +296,14 @@ class PixelSharp(nn.Module):
         if self.format == 'bit':
             x = x * 2. - 1.
         else:
-            x = x / 127.5 - 1.
+            x = (x / 127.5 - 1.) * 2.
 
+        x0 = self.x0.expand(x.size(0), -1, -1, -1)
+        x = torch.cat([x, x0], dim=1)
         vx = self.x2vx(x)
         hx = x
         # skip_connection = []
-        num_skips = 0
-        res_vx = self.vx2vx(vx)
+        # res_vx = self.vx2vx(vx)
         # NOTE: DO NOT USE RESIDUAL FOR THE FIRST H LAYER
         res_hx = 0.
 
@@ -307,8 +317,8 @@ class PixelSharp(nn.Module):
             hx = h_act(h_conv_x + v2h(v_conv_x))
             # h_act_x = checkpoint(h_act, h_conv_x + checkpoint(v2h, v_conv_x))
 
-            if i % (num_skips + 1) == 0:
-                res_vx = vx = vx + res_vx
+            if i % 1 == 0:
+                # res_vx = vx = vx + res_vx
                 res_hx = hx = hx + res_hx
 
         # x = sum(skip_connection) / len(skip_connection) + hx
@@ -503,8 +513,8 @@ def main():
     ctx = {'pscp': pscp.create()}
     ctx['device'] = device = torch.device('cuda')
     datasets = {
-        phase: torchvision.datasets.MNIST(
-        # phase: torchvision.datasets.CIFAR10(
+        # phase: torchvision.datasets.MNIST(
+        phase: torchvision.datasets.CIFAR10(
             'datasets',
             train=phase == 'train',
             download=True,
@@ -523,7 +533,7 @@ def main():
         )
         for phase, dataset in datasets.items()
     }
-    model = PixelSharp(1, 28, 28, format='softmax')
+    model = PixelSharp(3, 32, 32, format='softmax')
     # model = PixelSharp(3 * 8, 32, 32)
     print(f'r = {model.r}')
     model.to(device)
