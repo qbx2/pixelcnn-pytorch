@@ -184,7 +184,7 @@ class MaskedConv2d(torch.jit.ScriptModule):
         return x + self.bias
 
 
-class PixelSharp(nn.Module):
+class PixelCNN(nn.Module):
     def __init__(self, c_size, h_size, w_size, format='bit'):
         super().__init__()
         assert format in ('softmax', 'bit', 'byte')
@@ -193,11 +193,10 @@ class PixelSharp(nn.Module):
         self.sizes = input_sizes = c_size, h_size, w_size
         num_blocks = 1
         num_layers_per_block = 16
-        dim = 162
+        dim = 192
         input_dim = c_size + 1  # + x0
         v_conv, v_act, h_conv, h_act, v2h = [], [], [], [], []
 
-        # TODO: h0
         r = 0
 
         for i in range(num_blocks):
@@ -246,18 +245,13 @@ class PixelSharp(nn.Module):
                     # nn.Dropout2d(0.),
                     # nn.BatchNorm2d(input_dim),
                 ))
-                # input_dim = dim * 2
                 v2h.append(nn.Conv2d(dim, dim, 1))
                 input_sizes = (input_dim, *input_sizes[1:])
 
-        # TODO: move to F.pad with 1 to channels dim
-        self.x0 = nn.Parameter(torch.ones(1, 1, h_size, w_size))
         self.x2vx = nn.Sequential(
             Lambda(lambda x: x[..., :-1, :]),
             LearnedPadding2d(c_size, h_size - 1, w_size, 0, 0, 1, requires_grad=False),
         )
-        # vx2vx is for residual connection
-        self.vx2vx = nn.Conv2d(c_size + 1, v_conv[1].in_channels if len(v_conv) >= 2 else input_dim, 1)
         self.v_conv = nn.ModuleList(v_conv)
         self.v_act = nn.ModuleList(v_act)
         self.h_conv = nn.ModuleList(h_conv)
@@ -298,12 +292,11 @@ class PixelSharp(nn.Module):
         else:
             x = (x / 127.5 - 1.) * 2.
 
-        x0 = self.x0.expand(x.size(0), -1, -1, -1)
-        x = torch.cat([x, x0], dim=1)
+        # to distinguish zero paddings
+        x = F.pad(x, (0, 0, 0, 0, 0, 1), value=1)
         vx = self.x2vx(x)
         hx = x
         # skip_connection = []
-        # res_vx = self.vx2vx(vx)
         # NOTE: DO NOT USE RESIDUAL FOR THE FIRST H LAYER
         res_hx = 0.
 
@@ -318,7 +311,6 @@ class PixelSharp(nn.Module):
             # h_act_x = checkpoint(h_act, h_conv_x + checkpoint(v2h, v_conv_x))
 
             if i % 1 == 0:
-                # res_vx = vx = vx + res_vx
                 res_hx = hx = hx + res_hx
 
         # x = sum(skip_connection) / len(skip_connection) + hx
@@ -533,8 +525,8 @@ def main():
         )
         for phase, dataset in datasets.items()
     }
-    model = PixelSharp(3, 32, 32, format='softmax')
-    # model = PixelSharp(3 * 8, 32, 32)
+    model = PixelCNN(3, 32, 32, format='softmax')
+    # model = PixelCNN(3 * 8, 32, 32)
     print(f'r = {model.r}')
     model.to(device)
     optimizer = optim.RMSprop(
@@ -547,6 +539,7 @@ def main():
         optimizer,
         patience=3,
         verbose=True,
+        min_lr=1e-4,
     )
     '''
     scheduler = optim.lr_scheduler.CyclicLR(
